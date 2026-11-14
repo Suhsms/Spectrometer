@@ -14,6 +14,9 @@ From this directory, run:
 ```
 
 The launcher creates a local `.venv` and installs dependencies on first use.
+After updating the app, install any added dependencies with
+`.\.venv\Scripts\python.exe -m pip install -r requirements.txt`.
+Create a separate environment on each computer; do not copy `.venv` between PCs.
 If PowerShell script execution is restricted, use these commands directly:
 
 ```powershell
@@ -25,6 +28,36 @@ python -m venv .venv
 The application does not connect to a camera automatically. Choose a camera and
 resolution, then select **Connect**. Camera access may require enabling Windows
 Settings > Privacy & security > Camera > Let desktop apps access your camera.
+
+## IDS and DirectShow Cameras
+
+If your camera works with `cv2.VideoCapture(1, cv2.CAP_DSHOW)` but is not listed by
+Qt, select **OpenCV / DirectShow** in the **Capture** tab. Choose **Camera index 1**
+in the top camera selector, then **Connect**. The constant is `cv2.CAP_DSHOW`.
+Index 1 is the second DirectShow camera; index 0 is the first.
+
+This mode lists manual indices 0-15, not detected camera names. It remains
+available even when Qt detects no cameras. Use the same index as your working
+script. Close that script, IDS peak, and any other camera application before
+connecting if the driver permits only one application at a time.
+
+OpenCV is installed through the requirements above. The IDS/DirectShow driver
+must also be installed on the target computer; installing OpenCV does not install
+the IDS camera driver. Availability depends on the camera's driver exposing a
+DirectShow interface.
+
+DirectShow mode uses the driver's default resolution, frame rate, and exposure
+settings. Qt exposure and format controls are disabled in this mode. Frames are
+read in a background thread; pause freezes the measurement while acquisition
+continues. Disconnect requests a clean stop. If a driver read is still blocked,
+the app keeps the window open rather than destroying a running capture thread;
+retry Disconnect after the exposure/driver operation finishes.
+
+DirectShow calibration identity is index-based, not a physical camera serial
+number. Indices can change after reconnecting cameras or changing computers.
+Verify the camera, frame resolution, and optics before reusing a calibration.
+CSV metadata includes the selected backend and DirectShow index; exposure state
+is recorded as unknown in DirectShow mode.
 
 ## Capture and Crop
 
@@ -171,5 +204,6 @@ The design was informed by the local V5.0 source and bundled documentation:
 - `Annotations.txt`: processing-stage notes; `Language_ENG.txt`: UI terminology.
 
 The local `Docs` folder contains translations and linear-sensor datasheets, not
-a complete application manual. This implementation uses Qt Multimedia instead
-of porting Theremino's DirectShow code, and SciPy for filtering/extrema detection.
+a complete application manual. This implementation uses Qt Multimedia or
+OpenCV/DirectShow instead of porting Theremino's DirectShow code, and SciPy for
+filtering/extrema detection.

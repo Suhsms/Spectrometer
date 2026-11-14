@@ -1,6 +1,7 @@
 import csv
 import json
 import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,12 +10,61 @@ from unittest.mock import Mock, patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import numpy as np
+from PySide6.QtCore import QEventLoop, QThread, QTimer, Qt
 from PySide6.QtGui import QColor, QImage, QPainter
 from PySide6.QtMultimedia import QVideoFrame
 from PySide6.QtWidgets import QApplication, QTableWidgetItem
 
-from app import Spectrometer, spectrum_fill_brush
+from app import DirectShowCapture, Spectrometer, spectrum_fill_brush
 from processing import compensate_sensitivity
+
+
+class DirectShowCaptureTests(unittest.TestCase):
+    def test_worker_opens_requested_index_converts_color_and_releases(self):
+        driver = Mock()
+        driver.CAP_DSHOW = 700
+        capture = driver.VideoCapture.return_value
+        capture.isOpened.return_value = True
+        frame = np.array([[[10, 20, 30]]], dtype=np.uint8)
+        capture.read.side_effect = [(True, frame), (False, None)]
+        driver.cvtColor.side_effect = lambda image, mode: image[:, :, ::-1].copy()
+        worker = DirectShowCapture(1)
+        frames, errors = [], []
+        worker.frame_ready.connect(frames.append)
+        worker.failed.connect(errors.append)
+        with patch.dict(sys.modules, {"cv2": driver}):
+            worker.run()
+        driver.VideoCapture.assert_called_once_with(1, 700)
+        capture.release.assert_called_once()
+        np.testing.assert_array_equal(frames[0], [[[30, 20, 10]]])
+        self.assertIn("No frame received", errors[0])
+
+    def test_failed_open_reports_error_and_releases(self):
+        driver = Mock()
+        capture = driver.VideoCapture.return_value
+        capture.isOpened.return_value = False
+        worker = DirectShowCapture(1)
+        errors = []
+        worker.failed.connect(errors.append)
+        with patch.dict(sys.modules, {"cv2": driver}):
+            worker.run()
+        self.assertIn("Cannot open DirectShow camera index 1", errors[0])
+        capture.read.assert_not_called()
+        capture.release.assert_called_once()
+
+    def test_monochrome_worker_frames_become_rgb_without_changing_brightness(self):
+        driver = Mock()
+        capture = driver.VideoCapture.return_value
+        capture.isOpened.return_value = True
+        capture.read.side_effect = [(True, np.array([[42]], dtype=np.uint8)), (False, None)]
+        driver.cvtColor.side_effect = lambda image, mode: np.repeat(image[:, :, None], 3, axis=2)
+        worker = DirectShowCapture(1)
+        frames = []
+        worker.frame_ready.connect(frames.append)
+        with patch.dict(sys.modules, {"cv2": driver}):
+            worker.run()
+        np.testing.assert_array_equal(frames[0], [[[42, 42, 42]]])
+        capture.release.assert_called_once()
 
 
 class AppTests(unittest.TestCase):
@@ -40,6 +90,79 @@ class AppTests(unittest.TestCase):
             for column, value in enumerate(point):
                 self.window.calibration_table.setItem(row, column, QTableWidgetItem(str(value)))
         self.window.apply_calibration()
+
+    def test_directshow_indices_available_even_when_qt_detects_no_cameras(self):
+        with patch("app.QMediaDevices.videoInputs", return_value=[]):
+            self.window.capture_backend.setCurrentIndex(1)
+        self.assertEqual(self.window.devices.currentData(), 1)
+        self.assertTrue(self.window.connect_button.isEnabled())
+        self.assertFalse(self.window.format_select.isEnabled())
+
+    def test_directshow_connect_and_disconnect_use_selected_index(self):
+        self.window.capture_backend.setCurrentIndex(1)
+        with patch("app.DirectShowCapture") as worker_type:
+            worker = worker_type.return_value
+            worker.wait.return_value = True
+            self.window.toggle_camera()
+            worker_type.assert_called_once_with(1, self.window)
+            worker.start.assert_called_once()
+            self.assertFalse(self.window.capture_backend.isEnabled())
+            self.assertEqual(self.window.camera_id, "opencv-dshow:index:1")
+            self.window.disconnect_camera()
+            worker.requestInterruption.assert_called_once()
+            worker.wait.assert_called_once_with(3000)
+            self.assertIsNone(self.window.directshow)
+            self.assertTrue(self.window.capture_backend.isEnabled())
+
+    def test_directshow_frames_feed_spectrum_and_respect_pause(self):
+        worker = DirectShowCapture(1, self.window)
+        self.window.directshow = worker
+        worker.frame_ready.connect(self.window.receive_directshow_frame)
+        worker.frame_ready.emit(self.frame)
+        self.assertIsNotNone(self.window.latest)
+        previous = self.window.frame
+        self.window.pause_button.setChecked(True)
+        worker.frame_ready.emit(self.frame.copy())
+        self.assertIs(self.window.frame, previous)
+        self.window.directshow = None
+
+    def test_directshow_background_delivery_uses_gui_thread_and_stops_cleanly(self):
+        driver = Mock()
+        capture = driver.VideoCapture.return_value
+        capture.isOpened.return_value = True
+        capture.read.return_value = (True, self.frame)
+        driver.cvtColor.side_effect = lambda image, mode: image.copy()
+        worker = DirectShowCapture(1, self.window)
+        self.window.directshow = worker
+        worker.frame_ready.connect(self.window.receive_directshow_frame)
+        loop = QEventLoop()
+        worker.frame_ready.connect(loop.quit, Qt.QueuedConnection)
+        timeout = QTimer()
+        timeout.setSingleShot(True)
+        timeout.timeout.connect(loop.quit)
+        threads = []
+        with patch.dict(sys.modules, {"cv2": driver}), \
+                patch.object(self.window, "set_frame", side_effect=lambda frame: threads.append(QThread.currentThread())):
+            try:
+                timeout.start(3000)
+                QTimer.singleShot(0, worker.start)
+                loop.exec()
+            finally:
+                timeout.stop()
+                self.window.disconnect_camera()
+        self.assertTrue(threads)
+        self.assertTrue(all(thread == self.application.thread() for thread in threads))
+        self.assertFalse(worker.isRunning())
+        capture.release.assert_called_once()
+
+    def test_busy_directshow_driver_prevents_unsafe_thread_destruction(self):
+        worker = Mock()
+        worker.wait.return_value = False
+        self.window.directshow = worker
+        self.assertIs(self.window.disconnect_camera(), False)
+        self.assertIs(self.window.directshow, worker)
+        worker.wait.return_value = True
+        self.window.disconnect_camera()
 
     def test_sensitivity_toggle_requires_calibration_and_restores_original_when_off(self):
         self.assertFalse(self.window.sensitivity_toggle.isChecked())

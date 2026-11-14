@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 import pyqtgraph as pg
 import pyqtgraph.exporters
-from PySide6.QtCore import QSignalBlocker, Qt
+from PySide6.QtCore import QSignalBlocker, QThread, Qt, Signal, Slot
 from PySide6.QtGui import QBrush, QColor, QGradient, QIcon, QImage, QLinearGradient, QPainter, QPalette
 from PySide6.QtMultimedia import QCamera, QMediaCaptureSession, QMediaDevices, QVideoSink
 from PySide6.QtWidgets import (
@@ -50,6 +50,60 @@ def spectrum_fill_brush():
     return QBrush(gradient)
 
 
+class DirectShowCapture(QThread):
+    frame_ready = Signal(object)
+    opened = Signal()
+    failed = Signal(str)
+
+    def __init__(self, index, parent=None):
+        super().__init__(parent)
+        self.index = index
+
+    def run(self):
+        capture = None
+        try:
+            import cv2
+
+            capture = cv2.VideoCapture(self.index, cv2.CAP_DSHOW)
+            if not capture.isOpened():
+                self.failed.emit(
+                    f"Cannot open DirectShow camera index {self.index}. "
+                    "Check the index, driver, and whether another application is using it."
+                )
+                return
+            self.opened.emit()
+            last_emission = 0
+            while not self.isInterruptionRequested():
+                success, frame = capture.read()
+                if self.isInterruptionRequested():
+                    break
+                if not success or frame is None:
+                    self.failed.emit(f"No frame received from DirectShow camera {self.index}.")
+                    break
+                now = time.monotonic()
+                if now - last_emission < 1 / 15:
+                    continue
+                last_emission = now
+                if frame.ndim == 2:
+                    rgb = cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
+                elif frame.ndim == 3 and frame.shape[2] == 3:
+                    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                elif frame.ndim == 3 and frame.shape[2] == 4:
+                    rgb = cv2.cvtColor(frame, cv2.COLOR_BGRA2RGB)
+                else:
+                    raise ValueError("Unsupported DirectShow frame format.")
+                if rgb.dtype != np.uint8:
+                    raise ValueError("DirectShow capture requires 8-bit preview frames.")
+                self.frame_ready.emit(rgb.copy())
+        except ImportError:
+            self.failed.emit("OpenCV is unavailable. Run: python -m pip install -r requirements.txt")
+        except Exception as error:
+            self.failed.emit(f"DirectShow capture error: {error}")
+        finally:
+            if capture is not None:
+                capture.release()
+
+
 class Spectrometer(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -74,6 +128,7 @@ class Spectrometer(QMainWindow):
         self.resize(1240, 850)
         self.setMinimumSize(820, 650)
         self.camera = None
+        self.directshow = None
         self.camera_id = ""
         self.frame = None
         self.frame_size = None
@@ -200,8 +255,13 @@ class Spectrometer(QMainWindow):
         capture_tab = QWidget()
         self.control_tabs.addTab(capture_tab, "Capture")
         controls = QVBoxLayout(capture_tab)
-        controls.setSpacing(10)
-        self.heading("Capture", controls)
+        controls.setSpacing(8)
+        self.capture_backend = QComboBox()
+        self.capture_backend.addItem("Qt Multimedia", "qt")
+        self.capture_backend.addItem("OpenCV / DirectShow", "dshow")
+        self.capture_backend.setToolTip("Select OpenCV / DirectShow for cameras accessible via cv2.CAP_DSHOW")
+        self.capture_backend.currentIndexChanged.connect(self.capture_backend_changed)
+        controls.addWidget(self.capture_backend)
         self.format_select = QComboBox()
         self.format_select.setToolTip("Camera resolution and frame rate")
         controls.addWidget(self.format_select)
@@ -372,8 +432,28 @@ class Spectrometer(QMainWindow):
         """)
         self.update_actions()
 
+    def capture_connected(self):
+        return self.camera is not None or self.directshow is not None
+
+    def capture_backend_changed(self):
+        if self.capture_connected():
+            return
+        self.disconnect_camera()
+        self.refresh_devices()
+
     def refresh_devices(self):
         previous = self.devices.currentData()
+        if self.capture_backend.currentData() == "dshow":
+            with QSignalBlocker(self.devices):
+                self.devices.clear()
+                for index in range(16):
+                    self.devices.addItem(f"Camera index {index}", index)
+                selected = self.devices.findData(previous)
+                self.devices.setCurrentIndex(selected if selected >= 0 else 1)
+            self.devices.setEnabled(not self.capture_connected())
+            self.connect_button.setEnabled(True)
+            self.device_changed()
+            return
         available = QMediaDevices.videoInputs()
         with QSignalBlocker(self.devices):
             self.devices.clear()
@@ -395,9 +475,14 @@ class Spectrometer(QMainWindow):
                      if bytes(device.id()).hex() == self.devices.currentData()), None)
 
     def device_changed(self):
-        if self.camera:
+        if self.capture_connected():
             return
         self.format_select.clear()
+        if self.capture_backend.currentData() == "dshow":
+            self.format_select.addItem("Driver default resolution / frame rate")
+            self.format_select.setEnabled(False)
+            return
+        self.format_select.setEnabled(True)
         device = self.selected_device()
         if device is None:
             return
@@ -413,8 +498,31 @@ class Spectrometer(QMainWindow):
                 self.format_select.addItem(f"{key[0]} x {key[1]} | {key[2]} fps", camera_format)
 
     def toggle_camera(self):
-        if self.camera:
+        if self.capture_connected():
             self.disconnect_camera()
+            return
+        if self.capture_backend.currentData() == "dshow":
+            if sys.platform != "win32":
+                self.statusBar().showMessage("DirectShow capture requires Windows.")
+                return
+            index = self.devices.currentData()
+            if index is None:
+                return
+            self.camera_id = f"opencv-dshow:index:{index}"
+            self.directshow = DirectShowCapture(index, self)
+            self.directshow.frame_ready.connect(self.receive_directshow_frame)
+            self.directshow.opened.connect(self.directshow_opened)
+            self.directshow.failed.connect(self.directshow_error)
+            self.directshow.finished.connect(self.directshow_finished)
+            self.capture_backend.setEnabled(False)
+            self.devices.setEnabled(False)
+            self.format_select.setEnabled(False)
+            self.exposure_auto.setEnabled(False)
+            self.exposure.setEnabled(False)
+            self.exposure_note.setText("Exposure: driver-managed")
+            self.connect_button.setText("Disconnect")
+            self.statusBar().showMessage(f"Connecting DirectShow camera {index}...")
+            self.directshow.start()
             return
         device = self.selected_device()
         if device is None:
@@ -426,11 +534,35 @@ class Spectrometer(QMainWindow):
         self.camera.errorOccurred.connect(self.camera_error)
         self.camera.activeChanged.connect(self.camera_active_changed)
         self.session.setCamera(self.camera)
+        self.capture_backend.setEnabled(False)
         self.devices.setEnabled(False)
         self.format_select.setEnabled(False)
         self.connect_button.setText("Disconnect")
         self.statusBar().showMessage("Connecting camera...")
         self.camera.start()
+
+    @Slot()
+    def directshow_opened(self):
+        if self.sender() is self.directshow:
+            self.statusBar().showMessage("Live camera | OpenCV / DirectShow")
+
+    @Slot(object)
+    def receive_directshow_frame(self, frame):
+        if self.directshow is not None and self.sender() is self.directshow and not self.pause_button.isChecked():
+            self.set_frame(frame)
+
+    @Slot(str)
+    def directshow_error(self, message):
+        if self.directshow is not None and self.sender() is self.directshow:
+            self.camera_error(None, message)
+
+    @Slot()
+    def directshow_finished(self):
+        worker = self.sender()
+        if worker is self.directshow:
+            self.directshow = None
+            self.disconnect_camera()
+        worker.deleteLater()
 
     def camera_active_changed(self, active):
         if not active or self.camera is None:
@@ -464,6 +596,12 @@ class Spectrometer(QMainWindow):
             self.camera.setManualExposureTime(self.exposure.value() / 1000)
 
     def disconnect_camera(self):
+        if self.directshow is not None:
+            self.directshow.requestInterruption()
+            if not self.directshow.wait(3000):
+                self.statusBar().showMessage("Waiting for the camera driver. Retry Disconnect after the current exposure.")
+                return False
+            self.directshow = None
         if self.camera:
             camera = self.camera
             self.camera = None
@@ -481,8 +619,9 @@ class Spectrometer(QMainWindow):
         self.clear_feature_markers()
         self.clear_captures()
         self.readout.setText("No measurement")
+        self.capture_backend.setEnabled(True)
         self.devices.setEnabled(True)
-        self.format_select.setEnabled(True)
+        self.format_select.setEnabled(self.capture_backend.currentData() == "qt")
         self.connect_button.setText("Connect")
         self.pause_button.setChecked(False)
         self.statusBar().showMessage("Disconnected")
@@ -782,6 +921,8 @@ class Spectrometer(QMainWindow):
             metadata = {
                 "timestamp_utc": self.capture_time,
                 "camera_id": self.camera_id,
+                "capture_backend": self.capture_backend.currentData(),
+                "directshow_index": self.devices.currentData() if self.capture_backend.currentData() == "dshow" else None,
                 "frame_size": self.frame_size,
                 "roi": self.roi_values(),
                 "calibration": self.calibration.to_dict() if self.calibration else None,
@@ -804,7 +945,7 @@ class Spectrometer(QMainWindow):
                     "method": "I_corrected = I * QE(550) * 550 / (QE(wavelength) * wavelength)",
                     "qe_percent_points": IDS_QE_PROFILE.tolist(),
                 } if self.sensitivity_toggle.isChecked() else None,
-                "automatic_exposure": self.exposure_auto.isChecked(),
+                "automatic_exposure": self.exposure_auto.isChecked() if self.capture_backend.currentData() == "qt" else None,
             }
             with Path(filename).open("w", newline="", encoding="utf-8") as output:
                 output.write("# " + json.dumps(metadata) + "\n")
@@ -854,7 +995,9 @@ class Spectrometer(QMainWindow):
         self.image_button.setEnabled(self.latest is not None)
 
     def closeEvent(self, event):
-        self.disconnect_camera()
+        if self.disconnect_camera() is False:
+            event.ignore()
+            return
         event.accept()
 
 
